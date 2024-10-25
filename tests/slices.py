@@ -49,62 +49,6 @@ class SimpleTransformer(nn.Module):
             x = self.layers[layer_idx](x)
         return self.fc(x)
 
-
-def setup(rank, world_size, master_port):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(master_port)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-    logger = logging.getLogger(f"Rank {rank}")
-    logger.debug(f"Process group initialized. Using GPU {rank}")
-
-
-def setup_logging(rank: int) -> logging.Logger:
-    """
-    Sets up a logger for the given rank.
-
-    Args:
-        rank (int): The rank of the current process.
-
-    Returns:
-        logging.Logger: Configured logger for the rank.
-    """
-    logger = logging.getLogger(f"Rank {rank}")
-    logger.setLevel(logging.DEBUG)
-
-    # Create formatter
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Create File Handler
-    file_handler = logging.FileHandler(f"log_rank_{rank}.log")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-
-    # Create Stream Handler (optional, can be removed if not needed)
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.DEBUG)
-    stream_handler.setFormatter(formatter)
-
-    # Avoid adding multiple handlers to the logger
-    if not logger.handlers:
-        logger.addHandler(file_handler)
-        logger.addHandler(stream_handler)
-
-    return logger
-
-
-def cleanup(rank):
-    logger = logging.getLogger(f"Rank {rank}")
-    if dist.is_initialized():
-        dist.destroy_process_group()
-        logger.debug("Process group destroyed.")
-    else:
-        logger.warning("Process group not initialized; skipping cleanup.")
-
-
 async def upload_slice_for_window(
     bucket: str,
     model: nn.Module,
@@ -406,7 +350,59 @@ async def load_files_for_window_and_rank(
             window_files.append(file_path)
             logger.debug(f"Found file {filename} for window {window} and rank {rank}")
     return window_files
+def setup(rank, world_size, master_port):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(master_port)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    logger = logging.getLogger(f"Rank {rank}")
+    logger.debug(f"Process group initialized. Using GPU {rank}")
 
+
+def setup_logging(rank: int) -> logging.Logger:
+    """
+    Sets up a logger for the given rank.
+
+    Args:
+        rank (int): The rank of the current process.
+
+    Returns:
+        logging.Logger: Configured logger for the rank.
+    """
+    logger = logging.getLogger(f"Rank {rank}")
+    logger.setLevel(logging.DEBUG)
+
+    # Create formatter
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Create File Handler
+    file_handler = logging.FileHandler(f"log_rank_{rank}.log")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    # Create Stream Handler (optional, can be removed if not needed)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setFormatter(formatter)
+
+    # Avoid adding multiple handlers to the logger
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+
+    return logger
+
+
+def cleanup(rank):
+    logger = logging.getLogger(f"Rank {rank}")
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        logger.debug("Process group destroyed.")
+    else:
+        logger.warning("Process group not initialized; skipping cleanup.")
 
 def run_fsdp(rank, world_size, master_port):
     logger = logging.getLogger(f"Rank {rank}")
