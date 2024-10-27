@@ -41,8 +41,8 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 # Import local files.
 from boltz.common import *
-from hparams import load_hparams
-from dataset import DatasetLoader
+from boltz.hparams import load_hparams
+from boltz.dataset import DatasetLoader
 from boltz.fsdp import fsdp_auto_wrap_policy
 
 # GPU optimizations.
