@@ -27,19 +27,23 @@ import random
 import asyncio
 import argparse
 import threading
-import traceback
 from tqdm import tqdm
 import bittensor as bt
-from typing import List
 import torch.optim as optim
 from dotenv import dotenv_values
 from transformers import LlamaForCausalLM
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from functools import partial
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 # Import local files.
-from common import *
+from boltz.common import *
 from hparams import load_hparams
 from dataset import DatasetLoader
+from boltz.fsdp import fsdp_auto_wrap_policy
 
 # GPU optimizations.
 torch.backends.cudnn.benchmark = True
@@ -52,8 +56,8 @@ class Miner:
     def config():
         parser = argparse.ArgumentParser(description='Miner script')
         parser.add_argument('--project', type=str, default='aesop2', help='Optional wandb project name')
-        parser.add_argument('--netuid', type=int, default=220, help='Bittensor network UID.')
-        parser.add_argument('--bucket', type=str, default='decis', help='S3 bucket name')
+        parser.add_argument('--netuid', type=int, default=223, help='Bittensor network UID.')
+        parser.add_argument('--bucket', type=str, default='cont2', help='S3 bucket name')
         parser.add_argument('--actual_batch_size', type=int, default=8, help='Training batch size per accumulation.')
         parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
@@ -106,14 +110,66 @@ class Miner:
             except: pass
             wandb.init(project=self.config.project, resume='allow', name=f'M{self.uid}', config=self.config)
 
+        # Initialize distributed training
+        if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
+            # torchrun provides LOCAL_RANK, RANK, and WORLD_SIZE environment variables
+            self.local_rank = int(os.environ["LOCAL_RANK"])
+            self.global_rank = int(os.environ["RANK"])
+            self.world_size = int(os.environ["WORLD_SIZE"])
+
+            num_gpus = torch.cuda.device_count()
+            if self.local_rank >= num_gpus:
+                raise ValueError(f"Local rank {self.local_rank} exceeds number of available GPUs {num_gpus}.")
+
+            # Set the device for this process
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device("cuda", self.local_rank)
+
+            # Initialize the process group
+            dist.init_process_group(backend='nccl')
+            logger.info(f"Distributed training initialized on rank {self.global_rank} out of {self.world_size} processes.")
+        else:
+            # Single process execution
+            self.local_rank = 0
+            self.global_rank = 0
+            self.world_size = 1
+            self.device = torch.device(self.config.device)
+            logger.warning("Distributed training is not initialized. Running on a single process.")
+
+
+        # Identify if the current process is the master (rank 0).
+        is_master = self.global_rank == 0
+
         # Init model.
         logger.info('\n' + '-' * 40 + ' Hparams ' + '-' * 40)
         self.hparams = load_hparams()
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
         self.model = LlamaForCausalLM(config=self.hparams.model_config)
-        # self.model = LlamaForCausalLM.from_pretrained('TinyLlama/TinyLlama_v1.1')
-        self.model.to(self.config.device)
-        self.model.train()
+
+        # Wrap the model with FSDP if distributed training is initialized
+        if dist.is_initialized():
+            # Define the transformer layer names to wrap
+            transformer_layer_names = [LlamaDecoderLayer]
+
+            # Create the custom auto wrap policy
+            auto_wrap_policy = fsdp_auto_wrap_policy(
+                model=self.model,
+                transformer_layer_names=transformer_layer_names
+            )
+
+            # Wrap the model with FSDP using the custom auto wrap policy
+            self.model = FSDP(
+                self.model,
+                device_id=self.local_rank,
+                auto_wrap_policy=auto_wrap_policy,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+            )
+            logger.info(f"Model wrapped with FSDP on device {self.device} using custom auto wrap policy.")
+        else:
+            # Move the model to the device for single-process execution
+            self.model.to(self.device)
+            logger.info(f"Model moved to device {self.device}.")
+            self.model.train()
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.hparams.learning_rate,  # Peak learning rate
@@ -125,7 +181,8 @@ class Miner:
             self.optimizer, T_max=self.hparams.cosine_epoch_length,
             eta_min=self.hparams.eta_min, last_epoch=-1
         )
-
+        # Synchronize all processes
+        dist.barrier()
         # Init buckets.
         self.buckets = []
         for uid in self.metagraph.uids:
@@ -166,6 +223,7 @@ class Miner:
         self.listener = threading.Thread(target=self.block_listener, args=(self.loop,), daemon=True).start()
         
         # Optionally sync the model state by pulling model states from the history.
+        dist.barrier()
         if self.config.sync_state:
             history_windows = [ self.current_window - i for i in range (self.hparams.max_history) ]
             state_slices = await download_slices_for_buckets_and_windows(
@@ -193,6 +251,7 @@ class Miner:
                 window = self.current_window
                 
                 # Run for non-baseline miners.
+                dist.barrier()
                 if not self.config.baseline:
                     st = T()
                     state_slices = await download_slices_for_buckets_and_windows(
@@ -250,7 +309,7 @@ class Miner:
                     total_steps += 1
                     if random.random() < self.sample_rate and not exhuasted_window:
                         full_steps += 1
-                        input_ids = torch.tensor(batch, dtype=torch.long).to(self.model.device)
+                        input_ids = torch.tensor(batch, dtype=torch.long).to(self.device)
                         labels = input_ids.clone()
                         labels = torch.where(labels == self.hparams.tokenizer.pad_token_id, -100, labels)
                         with torch.amp.autocast(device_type=self.model.device.type, dtype=torch.bfloat16):  # Enable autocasting
@@ -273,7 +332,7 @@ class Miner:
                 logger.info(f"{P(window, train_duration)} \tLoss: [tan]{step_loss}[tan]")
                 if exhuasted_window: self.sample_rate = max(0.0001, self.sample_rate * 0.95)
                 else: self.sample_rate = min(1, self.sample_rate * 1.05)
-
+                dist.barrier()
                 # Run for non-baseline nodes.
                 if not self.config.baseline:
                     # Upload the delta for the previous window.
@@ -338,11 +397,14 @@ class Miner:
                             f"learning_rate": self.scheduler.get_last_lr()[0]
                         })
                                 
-            # Catch keyboard interrrupt.
+            # Catch keyboard interrupt.
             except KeyboardInterrupt:
                 logger.info("Training interrupted by user. Stopping the run.")
                 self.stop_event.set()
                 await self.update_task
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+                    logger.info("Destroyed process group.")
                 sys.exit(0)
             
             # Catch unknown.
@@ -381,4 +443,10 @@ class Miner:
                 time.sleep(1) 
             
 if __name__ == "__main__":
-    asyncio.run(Miner().run())
+    try:
+        asyncio.run(Miner().run())
+    finally:
+        # Ensure process group is destroyed on exit
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            logger.info("Destroyed process group on exit.")
