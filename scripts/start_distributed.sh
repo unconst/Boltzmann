@@ -20,7 +20,7 @@
 pm2 sendSignal SIGINT all
 pm2 delete all
 # Delete items from bucket
-BUCKET=${1:-cont2}
+BUCKET=${1:-decis}
 PROJECT=${2:-aesop}
 # python3 tools/clean.py --bucket $BUCKET
 
@@ -40,4 +40,4 @@ pm2 start "torchrun --nproc_per_node=${NGPU} \
     --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
     --local-ranks-filter ${LOG_RANK} --role rank \
     --tee 3 miner.py -- --actual_batch_size 6 --wallet.name Bistro \
-    --wallet.hotkey M111 --bucket $BUCKET --device cuda:1 --use_wandb --project $PROJECT --debug" --name M1 --interpreter none
+--wallet.hotkey M111 --bucket $BUCKET --device cuda:1 --use_wandb --project $PROJECT --debug" --name M1 --interpreter none
