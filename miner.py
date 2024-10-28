@@ -34,16 +34,13 @@ from dotenv import dotenv_values
 from transformers import LlamaForCausalLM
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
-from functools import partial
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 # Import local files.
 from boltz.common import *
 from boltz.hparams import load_hparams
 from boltz.dataset import DatasetLoader
-from boltz.fsdp import fsdp_auto_wrap_policy
+from boltz.fsdp import * 
 
 # GPU optimizations.
 torch.backends.cudnn.benchmark = True
@@ -111,34 +108,8 @@ class Miner:
             wandb.init(project=self.config.project, resume='allow', name=f'M{self.uid}', config=self.config)
 
         # Initialize distributed training
-        if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
-            # torchrun provides LOCAL_RANK, RANK, and WORLD_SIZE environment variables
-            self.local_rank = int(os.environ["LOCAL_RANK"])
-            self.global_rank = int(os.environ["RANK"])
-            self.world_size = int(os.environ["WORLD_SIZE"])
-
-            num_gpus = torch.cuda.device_count()
-            if self.local_rank >= num_gpus:
-                raise ValueError(f"Local rank {self.local_rank} exceeds number of available GPUs {num_gpus}.")
-
-            # Set the device for this process
-            torch.cuda.set_device(self.local_rank)
-            self.device = torch.device("cuda", self.local_rank)
-
-            # Initialize the process group
-            dist.init_process_group(backend='nccl')
-            logger.info(f"Distributed training initialized on rank {self.global_rank} out of {self.world_size} processes.")
-        else:
-            # Single process execution
-            self.local_rank = 0
-            self.global_rank = 0
-            self.world_size = 1
-            self.device = torch.device(self.config.device)
-            logger.warning("Distributed training is not initialized. Running on a single process.")
-
-
-        # Identify if the current process is the master (rank 0).
-        is_master = self.global_rank == 0
+        self.local_rank, self.global_rank, self.world_size, self.device = initialize_distributed_training(
+            device_config=self.config.device)
 
         # Init model.
         logger.info('\n' + '-' * 40 + ' Hparams ' + '-' * 40)
@@ -146,30 +117,20 @@ class Miner:
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
         self.model = LlamaForCausalLM(config=self.hparams.model_config)
 
-        # Wrap the model with FSDP if distributed training is initialized
-        if dist.is_initialized():
-            # Define the transformer layer names to wrap
-            transformer_layer_names = [LlamaDecoderLayer]
+        # Wrap the model with Fully Sharded Data Parallel (FSDP) if distributed training is initialized
+        self.model = wrap_model_with_fsdp(
+            model=self.model,
+            device_id=self.local_rank,
+            transformer_layer_names=[LlamaDecoderLayer],
+            is_distributed=dist.is_initialized(),
+            device=self.device
+        )
+        init_device = "cuda" 
+        self.model.to_empty(device=init_device)
+        self.model.init_weights()
+        self.model.train()
 
-            # Create the custom auto wrap policy
-            auto_wrap_policy = fsdp_auto_wrap_policy(
-                model=self.model,
-                transformer_layer_names=transformer_layer_names
-            )
-
-            # Wrap the model with FSDP using the custom auto wrap policy
-            self.model = FSDP(
-                self.model,
-                device_id=self.local_rank,
-                auto_wrap_policy=auto_wrap_policy,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-            )
-            logger.info(f"Model wrapped with FSDP on device {self.device} using custom auto wrap policy.")
-        else:
-            # Move the model to the device for single-process execution
-            self.model.to(self.device)
-            logger.info(f"Model moved to device {self.device}.")
-            self.model.train()
+        self.model_parts = [self.model]
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.hparams.learning_rate,  # Peak learning rate
