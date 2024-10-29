@@ -36,9 +36,9 @@ from transformers import LlamaForCausalLM
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Import local files.
-from common import *
-from hparams import load_hparams
-from dataset import DatasetLoader
+from boltz.common import *
+from boltz.hparams import load_hparams
+from boltz.dataset import DatasetLoader
 
 # GPU optimizations.
 torch.backends.cudnn.benchmark = True

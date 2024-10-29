@@ -22,7 +22,7 @@ import requests
 from types import SimpleNamespace
 from transformers import AutoTokenizer, LlamaConfig
 
-from common import *
+from boltz.common import *
 
 # Cache file path
 HPARAMS_FILE = "hparams.json"

@@ -28,7 +28,7 @@ import argparse
 import tempfile
 import traceback
 import bittensor as bt
-from hparams import load_hparams
+from boltz.hparams import load_hparams
 from types import SimpleNamespace
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 

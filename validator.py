@@ -34,11 +34,13 @@ import torch.optim as optim
 from dotenv import dotenv_values
 from transformers import LlamaForCausalLM
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 # Import local files.
-from common import *
-from hparams import load_hparams
-from dataset import DatasetLoader
+from boltz.common import *
+from boltz.hparams import load_hparams
+from boltz.dataset import DatasetLoader
+from boltz.fsdp import *
 
 # GPU optimizations.
 torch.backends.cudnn.benchmark = True
@@ -100,7 +102,10 @@ class Validator:
                     if run.name == f'V{self.uid}':
                         logger.info(f'Deleting old run: {run}'); run.delete()
             except: pass
-            wandb.init(project=self.config.project, resume='allow', name=f'V{self.uid}', config=self.config)
+            
+        # Initialize distributed training
+        self.local_rank, self.global_rank, self.world_size, self.device = initialize_distributed_training(
+            device_config=self.config.device)
 
         # Init model.
         logger.info('\n' + '-' * 40 + ' Hparams ' + '-' * 40)
@@ -108,7 +113,18 @@ class Validator:
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
         self.model = LlamaForCausalLM(config=self.hparams.model_config)
         # self.model = LlamaForCausalLM.from_pretrained('TinyLlama/TinyLlama_v1.1')
-        self.model.to(self.config.device)
+
+        # Wrap the model with Fully Sharded Data Parallel (FSDP) if distributed training is initialized
+        self.model = wrap_model_with_fsdp(
+            model=self.model,
+            device_id=self.local_rank,
+            transformer_layer_names=[LlamaDecoderLayer],
+            is_distributed=dist.is_initialized(),
+            device=self.device
+        )
+        init_device = "cuda" 
+        self.model.to_empty(device=init_device)
+        self.model.init_weights()
         self.model.eval()
         
         # Init buckets.

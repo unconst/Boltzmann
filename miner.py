@@ -27,19 +27,20 @@ import random
 import asyncio
 import argparse
 import threading
-import traceback
 from tqdm import tqdm
 import bittensor as bt
-from typing import List
 import torch.optim as optim
 from dotenv import dotenv_values
 from transformers import LlamaForCausalLM
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.distributed as dist
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 # Import local files.
-from common import *
-from hparams import load_hparams
-from dataset import DatasetLoader
+from boltz.common import *
+from boltz.hparams import load_hparams
+from boltz.dataset import DatasetLoader
+from boltz.fsdp import * 
 
 # GPU optimizations.
 torch.backends.cudnn.benchmark = True
@@ -106,14 +107,30 @@ class Miner:
             except: pass
             wandb.init(project=self.config.project, resume='allow', name=f'M{self.uid}', config=self.config)
 
+        # Initialize distributed training
+        self.local_rank, self.global_rank, self.world_size, self.device = initialize_distributed_training(
+            device_config=self.config.device)
+
         # Init model.
         logger.info('\n' + '-' * 40 + ' Hparams ' + '-' * 40)
         self.hparams = load_hparams()
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
         self.model = LlamaForCausalLM(config=self.hparams.model_config)
-        # self.model = LlamaForCausalLM.from_pretrained('TinyLlama/TinyLlama_v1.1')
-        self.model.to(self.config.device)
+
+        # Wrap the model with Fully Sharded Data Parallel (FSDP) if distributed training is initialized
+        self.model = wrap_model_with_fsdp(
+            model=self.model,
+            device_id=self.local_rank,
+            transformer_layer_names=[LlamaDecoderLayer],
+            is_distributed=dist.is_initialized(),
+            device=self.device
+        )
+        init_device = "cuda" 
+        self.model.to_empty(device=init_device)
+        self.model.init_weights()
         self.model.train()
+
+        self.model_parts = [self.model]
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.hparams.learning_rate,  # Peak learning rate
@@ -125,7 +142,8 @@ class Miner:
             self.optimizer, T_max=self.hparams.cosine_epoch_length,
             eta_min=self.hparams.eta_min, last_epoch=-1
         )
-
+        # Synchronize all processes
+        dist.barrier()
         # Init buckets.
         self.buckets = []
         for uid in self.metagraph.uids:
@@ -166,6 +184,7 @@ class Miner:
         self.listener = threading.Thread(target=self.block_listener, args=(self.loop,), daemon=True).start()
         
         # Optionally sync the model state by pulling model states from the history.
+        dist.barrier()
         if self.config.sync_state:
             history_windows = [ self.current_window - i for i in range (self.hparams.max_history) ]
             state_slices = await download_slices_for_buckets_and_windows(
@@ -193,6 +212,7 @@ class Miner:
                 window = self.current_window
                 
                 # Run for non-baseline miners.
+                dist.barrier()
                 if not self.config.baseline:
                     st = T()
                     state_slices = await download_slices_for_buckets_and_windows(
@@ -250,7 +270,7 @@ class Miner:
                     total_steps += 1
                     if random.random() < self.sample_rate and not exhuasted_window:
                         full_steps += 1
-                        input_ids = torch.tensor(batch, dtype=torch.long).to(self.model.device)
+                        input_ids = torch.tensor(batch, dtype=torch.long).to(self.device)
                         labels = input_ids.clone()
                         labels = torch.where(labels == self.hparams.tokenizer.pad_token_id, -100, labels)
                         with torch.amp.autocast(device_type=self.model.device.type, dtype=torch.bfloat16):  # Enable autocasting
@@ -273,7 +293,7 @@ class Miner:
                 logger.info(f"{P(window, train_duration)} \tLoss: [tan]{step_loss}[tan]")
                 if exhuasted_window: self.sample_rate = max(0.0001, self.sample_rate * 0.95)
                 else: self.sample_rate = min(1, self.sample_rate * 1.05)
-
+                dist.barrier()
                 # Run for non-baseline nodes.
                 if not self.config.baseline:
                     # Upload the delta for the previous window.
@@ -338,11 +358,14 @@ class Miner:
                             f"learning_rate": self.scheduler.get_last_lr()[0]
                         })
                                 
-            # Catch keyboard interrrupt.
+            # Catch keyboard interrupt.
             except KeyboardInterrupt:
                 logger.info("Training interrupted by user. Stopping the run.")
                 self.stop_event.set()
                 await self.update_task
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+                    logger.info("Destroyed process group.")
                 sys.exit(0)
             
             # Catch unknown.
@@ -381,4 +404,10 @@ class Miner:
                 time.sleep(1) 
             
 if __name__ == "__main__":
-    asyncio.run(Miner().run())
+    try:
+        asyncio.run(Miner().run())
+    finally:
+        # Ensure process group is destroyed on exit
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            logger.info("Destroyed process group on exit.")
