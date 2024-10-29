@@ -114,40 +114,12 @@ async def get_slices(filename: str, device: str) -> Dict[str, torch.Tensor]:
         weights_only=True,
     )
 
-
 async def apply_slices_to_model(
     model: nn.Module, window: int, seed: str, compression: int, key: str = "slice"
 ) -> List[str]:
-    """
-    Applies slices from a specific window to the given FSDP model.
-
-    Args:
-        model (torch.nn.Module): The FSDP-wrapped PyTorch model to which the slices will be applied.
-        window (int): The window identifier.
-        seed (str): The seed used for generating indices.
-        compression (int): The compression factor.
-        key (str): The key used to identify the slices.
-
-    Returns:
-        List[str]: A list of all the slice files that were applied.
-
-    Example:
-        slice_files = await apply_slices_to_model(
-            model=my_fsdp_model,
-            window=42,
-            seed="1234",
-            compression=10,
-            key='slice',
-        )
-
-    Notes:
-        - This function is adapted to work with FSDP. It ensures that all ranks participate
-          in collective operations required by FSDP to prevent hangs.
-        - Exception handling is added to ensure that any errors are caught, and all ranks exit gracefully.
-    """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    logger.debug(f"Rank {rank}: Starting apply_slices_to_model")
+    logger.debug(f"Rank {rank}: Starting apply_slices_to_model for window {window}")
 
     # Get indices associated with the window (all ranks must participate)
     try:
@@ -164,16 +136,26 @@ async def apply_slices_to_model(
     if rank == 0:
         try:
             slice_files: List[str] = await load_files_for_window(window=window, key=key)
-            logger.debug(f"Rank {rank}: Loaded {len(slice_files)} slice files")
+            logger.debug(f"Rank {rank}: Loaded {len(slice_files)} slice files for window {window}")
         except Exception as e:
             logger.exception(f"Rank {rank}: Failed to load slice files: {e}")
             slice_files = []
     else:
-        slice_files = []
+        slice_files = None  # Placeholder for other ranks
+
+    # Broadcast slice_files from rank 0 to all ranks
+    try:
+        slice_files_list = [slice_files] if rank == 0 else [None]
+        dist.broadcast_object_list(slice_files_list, src=0)
+        slice_files = slice_files_list[0]
+        logger.debug(f"Rank {rank}: Received slice_files: {slice_files}")
+    except Exception as e:
+        logger.exception(f"Rank {rank}: Failed to broadcast slice files: {e}")
+        sys.exit(1)  # Ensure all ranks exit
 
     if not slice_files:
         logger.warning(f"Rank {rank}: No slice files to process for window {window}")
-        return slice_files  # Early return, but all ranks have synchronized here
+        return slice_files  # All ranks return here synchronously
 
     # Initialize dictionaries to keep track of sums and counts
     param_sums: Dict[str, torch.Tensor] = {}
@@ -209,10 +191,27 @@ async def apply_slices_to_model(
             else:
                 logger.warning(f"Rank {rank}: No slices applied for parameter {name}")
 
-    # All ranks participate in updating the model parameters
+    # Broadcast param_sums and slices_per_param from rank 0 to all ranks
+    try:
+        if rank == 0:
+            data_to_broadcast = (param_sums, slices_per_param)
+        else:
+            data_to_broadcast = None
+
+        data_list = [data_to_broadcast]
+        dist.broadcast_object_list(data_list, src=0)
+        if rank != 0:
+            param_sums, slices_per_param = data_list[0]
+
+        logger.debug(f"Rank {rank}: Received param_sums and slices_per_param")
+    except Exception as e:
+        logger.exception(f"Rank {rank}: Failed to broadcast parameter sums: {e}")
+        sys.exit(1)  # Ensure all ranks exit
+
+    # All ranks proceed to update the model parameters
     try:
         # Retrieve the full state_dict (all ranks must participate)
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
             state_dict: Dict[str, torch.Tensor] = model.state_dict()
 
@@ -231,7 +230,7 @@ async def apply_slices_to_model(
                 logger.trace(f"Rank {rank}: No updates applied to parameter {name}")
 
         # Broadcast the updated state_dict from rank 0 to all other ranks
-        state_dict_list = [state_dict]
+        state_dict_list = [state_dict] if rank == 0 else [None]
         dist.broadcast_object_list(state_dict_list, src=0)
         state_dict = state_dict_list[0]
         logger.debug(f"Rank {rank}: Received updated state_dict from broadcast")
